@@ -1086,7 +1086,8 @@ def main():
             CCAT_NAME_ST:[MessageHandler(filters.TEXT & ~filters.COMMAND, msg_ccat_name_st)],
         },
         fallbacks=[
-            CallbackQueryHandler(cancel, pattern="^menu$"),
+            CallbackQueryHandler(cancel,     pattern="^menu$"),
+            CallbackQueryHandler(cb_my_cats, pattern="^my_cats$"),
             CommandHandler("cancel", cancel),
         ],
         per_message=False,
