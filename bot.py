@@ -18,7 +18,7 @@ from telegram.ext import (
 TOKEN = os.environ["BOT_TOKEN"]
 DB    = "expenses.db"
 
-# ── Categories ─────────────────────────────────────────────────────────────────
+# ── Default categories ──────────────────────────────────────────────────────────
 CATEGORIES = [
     ("🍔 Еда",          "food"),
     ("🚗 Транспорт",    "transport"),
@@ -33,6 +33,10 @@ CAT_COLOR = {
     "food":"#FF6B6B","transport":"#4ECDC4","entertainment":"#45B7D1",
     "clothes":"#96CEB4","health":"#FFEAA7","utilities":"#DDA0DD","other":"#98D8C8",
 }
+EXTRA_COLORS = [
+    "#F7DC6F","#A9CCE3","#A3E4D7","#F1948A","#BB8FCE",
+    "#73C6B6","#F0B27A","#AED6F1","#A9DFBF","#FAD7A0",
+]
 CAT_KW = {
     "еда":"food","продукты":"food","обед":"food","ужин":"food","завтрак":"food",
     "кофе":"food","кафе":"food","ресторан":"food","пицца":"food","суши":"food",
@@ -62,7 +66,8 @@ BG = "#0f0f1a"
     BUD_CAT, BUD_AMOUNT,
     REC_CAT, REC_AMOUNT, REC_DAY, REC_COMMENT,
     SEARCH,
-) = range(10)
+    CCAT_EMOJI, CCAT_NAME_ST,
+) = range(12)
 
 # ── DB ─────────────────────────────────────────────────────────────────────────
 def init_db():
@@ -98,6 +103,12 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 notify_enabled INTEGER DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS custom_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                emoji TEXT NOT NULL,
+                name TEXT NOT NULL
+            );
         """)
 
 def db(sql, params=(), fetchall=False, fetchone=False):
@@ -107,6 +118,45 @@ def db(sql, params=(), fetchall=False, fetchone=False):
         if fetchone: return cur.fetchone()
         return cur.lastrowid
 
+# ── Custom categories helpers ───────────────────────────────────────────────────
+def get_user_cats(uid):
+    return db("SELECT id, emoji, name FROM custom_categories WHERE user_id=? ORDER BY id",
+              (uid,), fetchall=True)
+
+def get_all_cats(uid):
+    """Default CATEGORIES + user's custom ones as list of (display_label, key)."""
+    cats = list(CATEGORIES)
+    for cid, emoji, name in get_user_cats(uid):
+        cats.append((f"{emoji} {name}", f"uc_{cid}"))
+    return cats
+
+def get_cat_name(uid, key):
+    if key.startswith("uc_"):
+        cid = int(key[3:])
+        r = db("SELECT emoji, name FROM custom_categories WHERE id=? AND user_id=?",
+               (cid, uid), fetchone=True)
+        if r: return f"{r[0]} {r[1]}"
+        return key
+    return CAT_NAME.get(key, key)
+
+def build_cat_dicts(uid):
+    """Returns (names_dict, colors_dict) for default + custom categories."""
+    names  = dict(CAT_NAME)
+    colors = dict(CAT_COLOR)
+    for cid, emoji, name in get_user_cats(uid):
+        key = f"uc_{cid}"
+        names[key]  = f"{emoji} {name}"
+        colors[key] = EXTRA_COLORS[cid % len(EXTRA_COLORS)]
+    return names, colors
+
+def add_user_cat(uid, emoji, name):
+    return db("INSERT INTO custom_categories(user_id, emoji, name) VALUES(?,?,?)",
+              (uid, emoji, name))
+
+def del_user_cat(cat_id, uid):
+    db("DELETE FROM custom_categories WHERE id=? AND user_id=?", (cat_id, uid))
+
+# ── Expense DB helpers ──────────────────────────────────────────────────────────
 def save_expense(uid, cat, amount, comment, is_income=False):
     db("INSERT INTO expenses(user_id,category,amount,comment,is_income,created_at) VALUES(?,?,?,?,?,?)",
        (uid, cat, amount, comment, 1 if is_income else 0, datetime.now().isoformat()))
@@ -192,7 +242,7 @@ async def check_budget(uid, cat, ctx):
                (uid, cat, ym), fetchone=True)
         spent = r[0] if r else 0
         pct   = spent / cat_lim * 100
-        name  = CAT_NAME.get(cat, cat)
+        name  = get_cat_name(uid, cat)
         if pct >= 100:
             await ctx.bot.send_message(uid, f"🔴 Лимит *«{name}»* превышен!\n{spent:,.0f} / {cat_lim:,.0f} ₽", parse_mode="Markdown")
         elif pct >= 80:
@@ -204,10 +254,10 @@ def _ax(ax):
     for sp in ax.spines.values(): sp.set_color("#333355")
     ax.tick_params(colors="#aaaacc")
 
-def pie_chart(stats, title):
-    labels = [CAT_NAME.get(k, k) for k in stats]
+def pie_chart(stats, title, cat_names, cat_colors):
+    labels = [cat_names.get(k, k) for k in stats]
     values = list(stats.values())
-    colors = [CAT_COLOR.get(k, "#ccc") for k in stats]
+    colors = [cat_colors.get(k, "#ccc") for k in stats]
     fig, ax = plt.subplots(figsize=(7, 5.5), facecolor=BG)
     _ax(ax)
     wedges, _, autotexts = ax.pie(values, colors=colors, autopct="%1.1f%%", startangle=90,
@@ -222,7 +272,7 @@ def pie_chart(stats, title):
     plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor=BG)
     buf.seek(0); plt.close(); return buf
 
-def bar_chart(months_data):
+def bar_chart(months_data, cat_names, cat_colors):
     months   = list(months_data.keys())
     all_cats = sorted({c for s in months_data.values() for c in s})
     labels   = [f"{MONTH_SH[int(m.split('-')[1])]}\n{m.split('-')[0]}" for m in months]
@@ -232,7 +282,7 @@ def bar_chart(months_data):
     for i, cat in enumerate(all_cats):
         offset = (i - n / 2 + 0.5) * w
         ax.bar(x + offset, [months_data[m].get(cat, 0) for m in months],
-               w * 0.88, label=CAT_NAME.get(cat, cat), color=CAT_COLOR.get(cat, "#ccc"), alpha=0.88)
+               w * 0.88, label=cat_names.get(cat, cat), color=cat_colors.get(cat, "#ccc"), alpha=0.88)
     ax.set_xticks(x); ax.set_xticklabels(labels, color="white", fontsize=10)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}"))
     ax.set_ylabel("Сумма (₽)", color="#aaaacc", fontsize=9)
@@ -279,12 +329,13 @@ def line_chart(uid, year, month):
 def export_csv(uid):
     rows = db("SELECT created_at,category,amount,comment,is_income FROM expenses WHERE user_id=? ORDER BY created_at",
               (uid,), fetchall=True)
+    names, _ = build_cat_dicts(uid)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Дата", "Категория", "Сумма (₽)", "Комментарий", "Тип"])
     for ca, cat, amt, comment, is_inc in rows:
         dt = datetime.fromisoformat(ca).strftime("%d.%m.%Y %H:%M")
-        w.writerow([dt, CAT_NAME.get(cat, cat), f"{amt:.2f}", comment or "", "Доход" if is_inc else "Расход"])
+        w.writerow([dt, names.get(cat, cat), f"{amt:.2f}", comment or "", "Доход" if is_inc else "Расход"])
     buf.seek(0)
     return io.BytesIO(buf.getvalue().encode("utf-8-sig"))
 
@@ -302,9 +353,9 @@ def parse_quick(text):
         rest.append(t)
     return amount, cat, (" ".join(rest) if rest else None)
 
-def cat_kb(prefix="cat_"):
+def cat_kb(all_cats, prefix="cat_"):
     rows = []; pair = []
-    for name, key in CATEGORIES:
+    for name, key in all_cats:
         pair.append(InlineKeyboardButton(name, callback_data=f"{prefix}{key}"))
         if len(pair) == 2: rows.append(pair); pair = []
     if pair: rows.append(pair)
@@ -323,7 +374,8 @@ def main_kb():
          InlineKeyboardButton("🔄 Регулярные",  callback_data="recurring")],
         [InlineKeyboardButton("🔍 Поиск",       callback_data="search"),
          InlineKeyboardButton("📤 Экспорт CSV", callback_data="export")],
-        [InlineKeyboardButton("🔔 Уведомления", callback_data="notify")],
+        [InlineKeyboardButton("🗂 Категории",   callback_data="my_cats"),
+         InlineKeyboardButton("🔔 Уведомления", callback_data="notify")],
     ])
 
 async def send_menu(update: Update, text="💰 *Трекер расходов*\n\nЧто хотите сделать?"):
@@ -350,25 +402,29 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Add expense / income ───────────────────────────────────────────────────────
 async def cb_add_exp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    uid = update.effective_user.id
     ctx.user_data["is_income"] = False
-    rows = cat_kb(); rows.append([CANCEL])
+    rows = cat_kb(get_all_cats(uid)); rows.append([CANCEL])
     await update.callback_query.edit_message_text("📂 *Выберите категорию расхода:*",
         reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
     return ADD_CAT
 
 async def cb_add_inc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    uid = update.effective_user.id
     ctx.user_data["is_income"] = True
-    rows = cat_kb(); rows.append([CANCEL])
+    rows = cat_kb(get_all_cats(uid)); rows.append([CANCEL])
     await update.callback_query.edit_message_text("📂 *Выберите категорию дохода:*",
         reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
     return ADD_CAT
 
 async def cb_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    uid = update.effective_user.id
     ctx.user_data["category"] = update.callback_query.data.removeprefix("cat_")
+    name = get_cat_name(uid, ctx.user_data["category"])
     await update.callback_query.edit_message_text(
-        f"✅ *{CAT_NAME.get(ctx.user_data['category'], '')}*\n\n💵 Введите сумму:",
+        f"✅ *{name}*\n\n💵 Введите сумму:",
         reply_markup=InlineKeyboardMarkup([[CANCEL]]), parse_mode="Markdown")
     return ADD_AMOUNT
 
@@ -403,7 +459,8 @@ async def _finish_add(update, ctx, comment):
     inc = ctx.user_data.get("is_income", False)
     save_expense(uid, cat, amt, comment, inc)
     icon = "💚" if inc else "💸"
-    text = f"{icon} *{'Доход' if inc else 'Расход'} сохранён!*\n\n{CAT_NAME.get(cat,cat)}\n*{amt:,.0f} ₽*"
+    name = get_cat_name(uid, cat)
+    text = f"{icon} *{'Доход' if inc else 'Расход'} сохранён!*\n\n{name}\n*{amt:,.0f} ₽*"
     if comment: text += f"\n💬 _{comment}_"
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("➕ Ещё", callback_data="add_inc" if inc else "add_exp"),
@@ -424,17 +481,18 @@ async def msg_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "❓ Не понял. Быстрый ввод: `500 кофе` или `еда 1500 обед`\n\nИли /start для меню.",
             parse_mode="Markdown")
         return
+    uid = update.effective_user.id
     if cat is None:
         ctx.user_data["quick_amount"]  = amount
         ctx.user_data["quick_comment"] = comment
-        rows = cat_kb("qcat_"); rows.append([CANCEL])
+        rows = cat_kb(get_all_cats(uid), "qcat_"); rows.append([CANCEL])
         await update.message.reply_text(
             f"*{amount:,.0f} ₽* — выберите категорию:",
             reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
         return
-    uid = update.effective_user.id
     save_expense(uid, cat, amount, comment)
-    text = f"✅ {CAT_NAME.get(cat,cat)} · *{amount:,.0f} ₽*"
+    name = get_cat_name(uid, cat)
+    text = f"✅ {name} · *{amount:,.0f} ₽*"
     if comment: text += f"\n💬 _{comment}_"
     await update.message.reply_text(text,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Меню", callback_data="menu")]]),
@@ -448,7 +506,8 @@ async def cb_qcat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     amount = ctx.user_data.get("quick_amount", 0)
     comm   = ctx.user_data.get("quick_comment")
     save_expense(uid, cat, amount, comm)
-    text = f"✅ {CAT_NAME.get(cat,cat)} · *{amount:,.0f} ₽*"
+    name = get_cat_name(uid, cat)
+    text = f"✅ {name} · *{amount:,.0f} ₽*"
     if comm: text += f"\n💬 _{comm}_"
     await update.callback_query.edit_message_text(text,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Меню", callback_data="menu")]]),
@@ -467,7 +526,8 @@ async def cb_del_last(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["del_id"] = eid
     dt   = datetime.fromisoformat(ca).strftime("%d.%m %H:%M")
     icon = "💚" if inc else "💸"
-    text = f"🗑 Удалить?\n\n{icon} {CAT_NAME.get(cat,cat)}\n*{amt:,.0f} ₽*"
+    name = get_cat_name(uid, cat)
+    text = f"🗑 Удалить?\n\n{icon} {name}\n*{amt:,.0f} ₽*"
     if comm: text += f"\n💬 {comm}"
     text += f"\n🕐 {dt}"
     await update.callback_query.edit_message_text(text, parse_mode="Markdown",
@@ -530,6 +590,7 @@ async def _month_stats(update, ctx, year, month):
         try: await update.callback_query.edit_message_text(f"За {MONTH_RU[month]} {year} расходов нет.", reply_markup=BACK)
         except: pass
         return
+    names, colors = build_cat_dicts(uid)
     total      = sum(stats.values())
     now        = datetime.now()
     days_gone  = now.day if (now.year == year and now.month == month) else monthrange(year, month)[1]
@@ -539,10 +600,10 @@ async def _month_stats(update, ctx, year, month):
     pm, py     = (12, year - 1) if month == 1 else (month - 1, year)
     prev       = monthly_total(uid, py, pm)
     loop  = asyncio.get_event_loop()
-    chart = await loop.run_in_executor(None, pie_chart, stats, f"{MONTH_RU[month]} {year}")
+    chart = await loop.run_in_executor(None, pie_chart, stats, f"{MONTH_RU[month]} {year}", names, colors)
     cap = f"📊 *{MONTH_RU[month]} {year}*\n\n"
     for cat, amt in sorted(stats.items(), key=lambda x: -x[1]):
-        cap += f"{CAT_NAME.get(cat,cat)}: *{amt:,.0f} ₽* ({amt/total*100:.1f}%)\n"
+        cap += f"{names.get(cat,cat)}: *{amt:,.0f} ₽* ({amt/total*100:.1f}%)\n"
     cap += f"\n💸 *Итого: {total:,.0f} ₽*"
     cap += f"\n📆 В день: *{avg:,.0f} ₽*"
     if now.year == year and now.month == month and days_gone < days_total:
@@ -561,7 +622,7 @@ async def _month_stats(update, ctx, year, month):
     if top:
         cap += "\n\n🏆 *Топ трат:*\n"
         for cat, amt, comm in top:
-            cap += f"  {CAT_NAME.get(cat,cat)} · {amt:,.0f} ₽"
+            cap += f"  {names.get(cat,cat)} · {amt:,.0f} ₽"
             if comm: cap += f" — _{comm}_"
             cap += "\n"
     await ctx.bot.send_photo(update.callback_query.message.chat_id,
@@ -600,8 +661,9 @@ async def cb_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for m in months[:4]:
         y, mo = map(int, m.split("-"))
         md[m] = monthly_stats(uid, y, mo)
+    names, colors = build_cat_dicts(uid)
     loop  = asyncio.get_event_loop()
-    chart = await loop.run_in_executor(None, bar_chart, md)
+    chart = await loop.run_in_executor(None, bar_chart, md, names, colors)
     cap = "📅 *Сравнение по месяцам:*\n\n"
     for m, s in md.items():
         y, mo = map(int, m.split("-"))
@@ -619,11 +681,12 @@ async def cb_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.callback_query.edit_message_text("История пуста.", reply_markup=BACK)
         return
+    names, _ = build_cat_dicts(uid)
     text = "📋 *Последние 10 записей:*\n\n"
     for eid, cat, amt, comm, inc, ca in rows:
         dt   = datetime.fromisoformat(ca).strftime("%d.%m  %H:%M")
         icon = "💚" if inc else "💸"
-        text += f"`{dt}`  {icon} {CAT_NAME.get(cat,cat)}\n   *{amt:,.0f} ₽*"
+        text += f"`{dt}`  {icon} {names.get(cat,cat)}\n   *{amt:,.0f} ₽*"
         if comm: text += f"  ·  _{comm}_"
         text += "\n\n"
     await update.callback_query.edit_message_text(text, parse_mode="Markdown",
@@ -646,11 +709,12 @@ async def msg_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("❌ Ничего не найдено.", reply_markup=BACK)
         return ConversationHandler.END
+    names, _ = build_cat_dicts(uid)
     text = f"🔍 *Найдено ({len(rows)}):*\n\n"
     for _, cat, amt, comm, inc, ca in rows[:15]:
         dt   = datetime.fromisoformat(ca).strftime("%d.%m.%y")
         icon = "💚" if inc else "💸"
-        text += f"`{dt}` {icon} {CAT_NAME.get(cat,cat)} · *{amt:,.0f} ₽*"
+        text += f"`{dt}` {icon} {names.get(cat,cat)} · *{amt:,.0f} ₽*"
         if comm: text += f"\n   _{comm}_"
         text += "\n"
     await update.message.reply_text(text, reply_markup=BACK, parse_mode="Markdown")
@@ -663,6 +727,7 @@ async def cb_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(); ym = now.strftime("%Y-%m")
     spent = monthly_total(uid, now.year, now.month)
     all_b = get_all_budgets(uid, ym)
+    names, _ = build_cat_dicts(uid)
     text  = f"💰 *Бюджет — {MONTH_RU[now.month]} {now.year}*\n\n"
     bl = all_b.get("total")
     if bl:
@@ -671,16 +736,14 @@ async def cb_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += f"Общий: {spent:,.0f} / {bl:,.0f} ₽\n`{bar}` {pct:.0f}%\n\n"
     else:
         text += "Общий лимит: не задан\n\n"
-    for key, _ in CATEGORIES:
-        lim = all_b.get(key[3:] if key[3:] in all_b else key)
-        pass
-    for cat_key in [k for _, k in CATEGORIES]:
+    all_cat_keys = [k for _, k in get_all_cats(uid)]
+    for cat_key in all_cat_keys:
         lim = all_b.get(cat_key)
         if lim:
             r = db("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE user_id=? AND category=? AND is_income=0 AND strftime('%Y-%m',created_at)=?",
                    (uid, cat_key, ym), fetchone=True)
             cs = r[0] if r else 0
-            text += f"{CAT_NAME.get(cat_key,cat_key)}: {cs:,.0f} / {lim:,.0f} ₽ ({cs/lim*100:.0f}%)\n"
+            text += f"{names.get(cat_key,cat_key)}: {cs:,.0f} / {lim:,.0f} ₽ ({cs/lim*100:.0f}%)\n"
     await update.callback_query.edit_message_text(text, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("💰 Общий лимит",   callback_data="bud_total")],
@@ -698,15 +761,17 @@ async def cb_bud_total(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_bud_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    rows = cat_kb("bc_"); rows.append([CANCEL])
+    uid = update.effective_user.id
+    rows = cat_kb(get_all_cats(uid), "bc_"); rows.append([CANCEL])
     await update.callback_query.edit_message_text("📂 Выберите категорию:",
         reply_markup=InlineKeyboardMarkup(rows))
     return BUD_CAT
 
 async def cb_bud_cat_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    uid = update.effective_user.id
     ctx.user_data["bud_cat"] = update.callback_query.data.removeprefix("bc_")
-    name = CAT_NAME.get(ctx.user_data["bud_cat"], "")
+    name = get_cat_name(uid, ctx.user_data["bud_cat"])
     await update.callback_query.edit_message_text(
         f"💰 Введите лимит для *{name}* (₽):",
         reply_markup=InlineKeyboardMarkup([[CANCEL]]), parse_mode="Markdown")
@@ -723,7 +788,7 @@ async def msg_bud_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     cat = ctx.user_data.get("bud_cat")
     set_budget(uid, datetime.now().strftime("%Y-%m"), amt, cat)
-    name = CAT_NAME.get(cat, cat) if cat else "общий"
+    name = get_cat_name(uid, cat) if cat else "общий"
     await update.message.reply_text(f"✅ Лимит *{name}* — {amt:,.0f} ₽ установлен.",
         reply_markup=BACK, parse_mode="Markdown")
     return ConversationHandler.END
@@ -733,10 +798,11 @@ async def cb_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     uid  = update.effective_user.id
     recs = get_recurring(uid)
+    names, _ = build_cat_dicts(uid)
     text = "🔄 *Регулярные траты*\n\n"
     if recs:
         for rid, cat, amt, comm, day in recs:
-            text += f"• {day}-го числа — {CAT_NAME.get(cat,cat)}, *{amt:,.0f} ₽*"
+            text += f"• {day}-го числа — {names.get(cat,cat)}, *{amt:,.0f} ₽*"
             if comm: text += f" _{comm}_"
             text += "\n"
     else:
@@ -745,7 +811,7 @@ async def cb_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = []
     for rid, cat, amt, comm, day in recs:
         rows.append([InlineKeyboardButton(
-            f"🗑 {CAT_NAME.get(cat,cat)} {amt:,.0f}₽ ({day}-го)",
+            f"🗑 {names.get(cat,cat)} {amt:,.0f}₽ ({day}-го)",
             callback_data=f"rdel_{rid}")])
     rows.append([InlineKeyboardButton("➕ Добавить", callback_data="rec_add")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu")])
@@ -760,16 +826,19 @@ async def cb_rec_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cb_rec_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    rows = cat_kb("rc_"); rows.append([CANCEL])
+    uid = update.effective_user.id
+    rows = cat_kb(get_all_cats(uid), "rc_"); rows.append([CANCEL])
     await update.callback_query.edit_message_text("📂 Выберите категорию:",
         reply_markup=InlineKeyboardMarkup(rows))
     return REC_CAT
 
 async def cb_rec_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    uid = update.effective_user.id
     ctx.user_data["rec_cat"] = update.callback_query.data.removeprefix("rc_")
+    name = get_cat_name(uid, ctx.user_data["rec_cat"])
     await update.callback_query.edit_message_text(
-        f"✅ *{CAT_NAME.get(ctx.user_data['rec_cat'],'')}*\n\nВведите сумму:",
+        f"✅ *{name}*\n\nВведите сумму:",
         reply_markup=InlineKeyboardMarkup([[CANCEL]]), parse_mode="Markdown")
     return REC_AMOUNT
 
@@ -813,13 +882,84 @@ async def _save_recurring(update, ctx, comment):
     uid = update.effective_user.id
     db("INSERT INTO recurring(user_id,category,amount,comment,day_of_month) VALUES(?,?,?,?,?)",
        (uid, ctx.user_data["rec_cat"], ctx.user_data["rec_amt"], comment, ctx.user_data["rec_day"]))
-    name = CAT_NAME.get(ctx.user_data["rec_cat"], "")
+    name = get_cat_name(uid, ctx.user_data["rec_cat"])
     text = f"✅ *Регулярная трата сохранена!*\n\n{name} · {ctx.user_data['rec_amt']:,.0f} ₽\nКаждое {ctx.user_data['rec_day']}-е число"
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Меню", callback_data="menu")]])
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+
+# ── My categories ──────────────────────────────────────────────────────────────
+async def cb_my_cats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    uid  = update.effective_user.id
+    cats = get_user_cats(uid)
+    text = "🗂 *Мои категории*\n\n"
+    if cats:
+        for cid, emoji, name in cats:
+            text += f"• {emoji} {name}\n"
+        text += "\nНажмите на категорию чтобы удалить:"
+    else:
+        text += "У вас пока нет своих категорий.\n\nДобавьте первую!"
+    rows = []
+    for cid, emoji, name in cats:
+        rows.append([InlineKeyboardButton(f"🗑 {emoji} {name}", callback_data=f"ccat_del_{cid}")])
+    rows.append([InlineKeyboardButton("➕ Добавить категорию", callback_data="ccat_add")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu")])
+    await update.callback_query.edit_message_text(text,
+        reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+
+async def cb_ccat_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    uid    = update.effective_user.id
+    cat_id = int(update.callback_query.data.removeprefix("ccat_del_"))
+    del_user_cat(cat_id, uid)
+    await cb_my_cats(update, ctx)
+
+async def cb_ccat_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        "🎨 *Новая категория*\n\nШаг 1/2 — отправьте эмодзи для категории:\n\n"
+        "_Например: 🎮 или 🐶 или 🏋️_",
+        reply_markup=InlineKeyboardMarkup([[CANCEL]]), parse_mode="Markdown")
+    return CCAT_EMOJI
+
+async def msg_ccat_emoji(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if len(text) > 10:
+        await update.message.reply_text(
+            "❌ Слишком длинно. Отправьте один эмодзи, например 🎮",
+            reply_markup=InlineKeyboardMarkup([[CANCEL]]))
+        return CCAT_EMOJI
+    ctx.user_data["new_cat_emoji"] = text
+    await update.message.reply_text(
+        f"✅ Эмодзи: *{text}*\n\nШаг 2/2 — введите название категории:\n\n"
+        "_Например: Игры или Питомец или Спортзал_",
+        reply_markup=InlineKeyboardMarkup([[CANCEL]]), parse_mode="Markdown")
+    return CCAT_NAME_ST
+
+async def msg_ccat_name_st(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if len(name) > 40:
+        await update.message.reply_text(
+            "❌ Название слишком длинное (максимум 40 символов). Попробуйте ещё раз:",
+            reply_markup=InlineKeyboardMarkup([[CANCEL]]))
+        return CCAT_NAME_ST
+    if not name:
+        await update.message.reply_text("❌ Название не может быть пустым:")
+        return CCAT_NAME_ST
+    uid   = update.effective_user.id
+    emoji = ctx.user_data.get("new_cat_emoji", "📌")
+    add_user_cat(uid, emoji, name)
+    await update.message.reply_text(
+        f"✅ *Категория добавлена!*\n\n{emoji} {name}\n\n"
+        "Теперь она будет доступна при добавлении расходов.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗂 Мои категории", callback_data="my_cats")],
+            [InlineKeyboardButton("🏠 Меню",          callback_data="menu")],
+        ]), parse_mode="Markdown")
+    return ConversationHandler.END
 
 # ── Export ─────────────────────────────────────────────────────────────────────
 async def cb_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -870,9 +1010,10 @@ async def job_recurring(ctx: ContextTypes.DEFAULT_TYPE):
     for rid, uid, cat, amt, comm in rows:
         save_expense(uid, cat, amt, comm or "Регулярный платёж")
         db("UPDATE recurring SET last_date=? WHERE id=?", (ym, rid))
+        name = get_cat_name(uid, cat)
         try:
             await ctx.bot.send_message(uid,
-                f"🔄 *Регулярная трата добавлена*\n\n{CAT_NAME.get(cat,cat)} · {amt:,.0f} ₽",
+                f"🔄 *Регулярная трата добавлена*\n\n{name} · {amt:,.0f} ₽",
                 parse_mode="Markdown")
         except: pass
 
@@ -884,12 +1025,13 @@ async def job_month_report(ctx: ContextTypes.DEFAULT_TYPE):
     for (uid,) in uids:
         stats = monthly_stats(uid, now.year, now.month)
         if not stats: continue
+        names, colors = build_cat_dicts(uid)
         total  = sum(stats.values())
         income = monthly_total(uid, now.year, now.month, is_income=True)
-        chart  = pie_chart(stats, f"Итоги {MONTH_RU[now.month]} {now.year}")
+        chart  = pie_chart(stats, f"Итоги {MONTH_RU[now.month]} {now.year}", names, colors)
         cap = f"📊 *Итоги {MONTH_RU[now.month]} {now.year}*\n\n"
         for cat, amt in sorted(stats.items(), key=lambda x: -x[1]):
-            cap += f"{CAT_NAME.get(cat,cat)}: *{amt:,.0f} ₽*\n"
+            cap += f"{names.get(cat,cat)}: *{amt:,.0f} ₽*\n"
         cap += f"\n💸 Расходы: *{total:,.0f} ₽*"
         if income > 0:
             cap += f"\n💚 Доходы: *{income:,.0f} ₽*\n⚖️ Баланс: *{income-total:+,.0f} ₽*"
@@ -915,15 +1057,16 @@ def main():
 
     conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(cb_add_exp,      pattern="^add_exp$"),
-            CallbackQueryHandler(cb_add_inc,      pattern="^add_inc$"),
-            CallbackQueryHandler(cb_bud_total,    pattern="^bud_total$"),
-            CallbackQueryHandler(cb_bud_cat,      pattern="^bud_cat$"),
-            CallbackQueryHandler(cb_rec_add,      pattern="^rec_add$"),
-            CallbackQueryHandler(cb_search,       pattern="^search$"),
+            CallbackQueryHandler(cb_add_exp,  pattern="^add_exp$"),
+            CallbackQueryHandler(cb_add_inc,  pattern="^add_inc$"),
+            CallbackQueryHandler(cb_bud_total, pattern="^bud_total$"),
+            CallbackQueryHandler(cb_bud_cat,  pattern="^bud_cat$"),
+            CallbackQueryHandler(cb_rec_add,  pattern="^rec_add$"),
+            CallbackQueryHandler(cb_search,   pattern="^search$"),
+            CallbackQueryHandler(cb_ccat_add, pattern="^ccat_add$"),
         ],
         states={
-            ADD_CAT:    [CallbackQueryHandler(cb_cat,           pattern="^cat_")],
+            ADD_CAT:    [CallbackQueryHandler(cb_cat,            pattern="^cat_")],
             ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_amount)],
             ADD_COMMENT:[
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_comment),
@@ -931,7 +1074,7 @@ def main():
             ],
             BUD_CAT:    [CallbackQueryHandler(cb_bud_cat_chosen, pattern="^bc_")],
             BUD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_bud_amount)],
-            REC_CAT:    [CallbackQueryHandler(cb_rec_cat,       pattern="^rc_")],
+            REC_CAT:    [CallbackQueryHandler(cb_rec_cat,        pattern="^rc_")],
             REC_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_rec_amount)],
             REC_DAY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_rec_day)],
             REC_COMMENT:[
@@ -939,6 +1082,8 @@ def main():
                 CallbackQueryHandler(cb_rec_skip, pattern="^rec_skip$"),
             ],
             SEARCH:     [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_search)],
+            CCAT_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_ccat_emoji)],
+            CCAT_NAME_ST:[MessageHandler(filters.TEXT & ~filters.COMMAND, msg_ccat_name_st)],
         },
         fallbacks=[
             CallbackQueryHandler(cancel, pattern="^menu$"),
@@ -966,6 +1111,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_export,      pattern="^export$"))
     app.add_handler(CallbackQueryHandler(cb_notify,      pattern="^notify$"))
     app.add_handler(CallbackQueryHandler(cb_qcat,        pattern="^qcat_"))
+    app.add_handler(CallbackQueryHandler(cb_my_cats,     pattern="^my_cats$"))
+    app.add_handler(CallbackQueryHandler(cb_ccat_del,    pattern="^ccat_del_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_quick))
 
     jq = app.job_queue
